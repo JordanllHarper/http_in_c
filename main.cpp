@@ -80,6 +80,30 @@ char *formatHeader(Header h) {
     return line;
 }
 
+char *formatHeaders(Header *headers, size_t additionalHeadersSize,
+                    size_t additionalHeadersLen) {
+    char *headerData = (char *)malloc(additionalHeadersSize);
+    int headerErr = snprintf(headerData, additionalHeadersSize, "%s\n",
+                             formatHeader(headers[0]));
+    if (headerErr < 0) {
+        printf("Parsing header data error\n");
+        return NULL;
+    }
+
+    // offset by as we handled previous header outside loop
+    for (int i = 1; i < additionalHeadersLen; i++) {
+        Header h = headers[i];
+        char *line = formatHeader(h);
+        headerErr = snprintf(headerData, additionalHeadersSize, "%s%s\n",
+                             headerData, line);
+        if (headerErr < 0) {
+            printf("Parsing header data error\n");
+            return NULL;
+        }
+    }
+    return headerData;
+}
+
 // Format the given `Request` into an HTTP message.
 // If an error occurs, this function will return NULL.
 // Caller owns memory.
@@ -91,59 +115,39 @@ char *format(Request request) {
     char const *version = request.protocolVersion;
     size_t versionLen = strlen(version);
 
-    size_t controlDataLen = (methodLen + pathLen + versionLen + 3);
+    size_t controlDataSize = (methodLen + pathLen + versionLen + 3);
 
-    char *controlData = (char *)malloc(controlDataLen);
+    char *controlData = (char *)malloc(controlDataSize);
 
-    int controlCode = snprintf(controlData, controlDataLen, "%s %s %s\n",
+    int controlCode = snprintf(controlData, controlDataSize, "%s %s %s\n",
                                method, path, version);
     if (controlCode < 0) {
         printf("Control code error\n");
         return NULL;
     }
 
-    char *headerData = (char *)malloc(request.additionalHeadersSize);
+    size_t headersSize = request.additionalHeadersSize;
+    size_t headersLen = request.additionalHeadersLen;
 
-    int headerErr = snprintf(headerData, request.additionalHeadersSize, "%s\n",
-                             formatHeader(request.additionalHeaders[0]));
+    char *headerData =
+        formatHeaders(request.additionalHeaders, headersSize, headersLen);
 
-    if (headerErr < 0) {
-        printf("Parsing header data error\n");
-        return NULL;
+    size_t bodySize = 0;
+    if (request.body != NULL) {
+        bodySize = strlen(request.body);
+    }
+    size_t totalSize = controlDataSize + headersSize + bodySize;
+    char *buf = (char *)malloc(totalSize);
+
+    int concatCode;
+    if (request.body != NULL) {
+        concatCode = snprintf(buf, totalSize, "%s\n%s\n%s\n", controlData,
+                              headerData, request.body);
+    } else {
+        concatCode =
+            snprintf(buf, totalSize, "%s\n%s\n", controlData, headerData);
     }
 
-    // offset by as we handled previous header outside loop
-    for (int i = 1; i < request.additionalHeadersLen; i++) {
-        Header h = request.additionalHeaders[i];
-        char *line = formatHeader(h);
-        headerErr = snprintf(headerData, request.additionalHeadersSize,
-                             "%s%s\n", headerData, line);
-        if (strcmp(h.key, "Content-Length") == 0) {
-            continue;
-        }
-        if (headerErr < 0) {
-            printf("Parsing header data error\n");
-            return NULL;
-        }
-    }
-
-    size_t bodySize = strlen(request.body);
-
-    int size = (int)(ceil(log10(bodySize)) + 1);
-
-    char *bodySizeBuf = (char *)malloc(size);
-    sprintf(bodySizeBuf, "%zu", bodySize);
-    Header contentTypeHeader =
-        Header{.key = "Content-Length", .value = bodySizeBuf};
-
-    size_t contentTypeHeaderSize = measureHeader(contentTypeHeader);
-    char *contentTypeHeaderStr = formatHeader(contentTypeHeader);
-
-    size_t totalLen =
-        controlDataLen + request.additionalHeadersSize + contentTypeHeaderSize;
-    char *buf = (char *)malloc(totalLen);
-    int concatCode = snprintf(buf, totalLen, "%s\n%s\n%s", controlData,
-                              contentTypeHeaderStr, headerData);
     if (concatCode < 0) {
         printf("Concat code error\n");
         return NULL;
@@ -161,8 +165,16 @@ int main(int argc, char *argv[]) {
     // Host: www.example.com
     // User-Agent: HttpInC
     // Accept-Language: en
+    // char const *body = "Hello, World!";
+    // size_t len = strlen(body);
+    // int toAlloc = (int)((ceil(log10(len)) + 1) * sizeof(char));
+    // printf("Got here\n");
+    // char *contentLengthBuf = (char *)malloc(toAlloc);
+    // snprintf(contentLengthBuf, toAlloc, "%zu", len);
+
     Header h1 = Header{"User-Agent", "HttpInC"};
     Header h2 = Header{"Accept-Language", "en"};
+    // Header h3 = Header{"Content-Length", contentLengthBuf};
 
     size_t headersSize = measureHeader(h1) + measureHeader(h2);
     size_t headersLen = 2;
