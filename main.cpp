@@ -1,19 +1,16 @@
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 // HTTP in C
 // NOTE: Optional means value can be NULL
-
-typedef char const *Method;
-typedef char const *ProtocolVersion;
-typedef char const *Scheme;
-typedef char const *HostIdentifier;
-typedef char const *Path;
-typedef int16_t Port;
 
 typedef struct Query {
     char const *key;
@@ -27,38 +24,36 @@ typedef struct Header {
     char const *value;
 } Header;
 
-typedef struct Authority {
-    // e.g. something.com
-    HostIdentifier hostIdentifier;
+typedef struct Request {
+    // HTTP scheme
+    // Either http or https
+    char const *scheme;
+    // Identifier of the host - can be IP
+    // e.g. www.something.com
+    char const *hostIdentifier;
     // Port number of target
     // Optional
     // e.g.8080
-    Port *port;
-} Authority;
-
-// A complete HTTP URI
-// Full example: http://www.someone.com:80/some/path?with=query
-typedef struct HttpUri {
-    // HTTP scheme
-    // Either http or https
-    Scheme scheme;
-    // Authority - thought of as Host
-    // e.g. someone.com
-    Authority authority;
-    // Path
-    Path path;
+    uint16_t port;
+    // Sub path from the hostIdentifier
+    char const *path;
     // List of query parameters
     // Optional
     Query *query;
-} HttpUri;
-
-typedef struct Request {
-    Method method;
-    ProtocolVersion protocolVersion;
-    HttpUri httpUri;
+    // Method - GET, POST, etc.
+    char const *method;
+    // Version - HTTP/1.1
+    char const *protocolVersion;
+    // The additional headers to add onto the request
+    // e.g. User-Agent: HttpInC
     Header *additionalHeaders;
-    size_t headersLen;
-    char const *content;
+    // Number of headers given
+    size_t additionalHeadersLen;
+    // Size of the additional headers content
+    // e.g. sizeof("Content-Type")
+    size_t additionalHeadersSize;
+    // The body of the request
+    char const *body;
 } Request;
 
 typedef struct Response {
@@ -68,46 +63,96 @@ typedef struct Response {
 // TODO: Check for userinfo in url and treat as error - deprecated and malicious
 // TODO: Multiple headers with same key are concatenated together
 
+size_t measureHeader(Header h) { return strlen(h.key) + strlen(h.value) + 3; }
+
+char *formatHeader(Header h) {
+    const char *key = h.key;
+    size_t keyLen = strlen(key);
+    const char *value = h.value;
+    size_t valueLen = strlen(value);
+
+    size_t lineSize = keyLen + valueLen + 3;
+    char *line = (char *)malloc(lineSize);
+    int headerErr = snprintf(line, lineSize, "%s: %s\n", key, value);
+    if (headerErr < 0) {
+        return NULL;
+    }
+    return line;
+}
+
 // Format the given `Request` into an HTTP message.
 // If an error occurs, this function will return NULL.
 // Caller owns memory.
 char *format(Request request) {
     char const *method = request.method;
     size_t methodLen = strlen(method);
-    char const *path = request.httpUri.path;
+    char const *path = request.path;
     size_t pathLen = strlen(path);
     char const *version = request.protocolVersion;
     size_t versionLen = strlen(version);
 
-    size_t controlDataLen = methodLen + pathLen + versionLen + 3;
-
-    size_t headersContentLen = 0;
-
-    // TODO: We don't know here how much memory we need to allocate to hold all
-    // the items so we'll probably need some dynamic allocation
-    // char *headerData = malloc(size_t size);
-    for (int i = 0; i < request.headersLen; i++) {
-        Header h = request.additionalHeaders[i];
-
-        const char *key = h.key;
-        size_t keyLen = strlen(key);
-        const char *value = h.value;
-        size_t valueLen = strlen(value);
-
-        // +2 for colon and extra space
-        headersContentLen += keyLen + valueLen + 2;
-    }
+    size_t controlDataLen = (methodLen + pathLen + versionLen + 3);
 
     char *controlData = (char *)malloc(controlDataLen);
 
-    int code = snprintf(controlData, controlDataLen, "%s %s %s\n", method, path,
-                        version);
-
-    if (code < 0) {
-        // error - handle and print
+    int controlCode = snprintf(controlData, controlDataLen, "%s %s %s\n",
+                               method, path, version);
+    if (controlCode < 0) {
+        printf("Control code error\n");
         return NULL;
     }
-    return controlData;
+
+    char *headerData = (char *)malloc(request.additionalHeadersSize);
+
+    int headerErr = snprintf(headerData, request.additionalHeadersSize, "%s\n",
+                             formatHeader(request.additionalHeaders[0]));
+
+    if (headerErr < 0) {
+        printf("Parsing header data error\n");
+        return NULL;
+    }
+
+    // offset by as we handled previous header outside loop
+    for (int i = 1; i < request.additionalHeadersLen; i++) {
+        Header h = request.additionalHeaders[i];
+        char *line = formatHeader(h);
+        headerErr = snprintf(headerData, request.additionalHeadersSize,
+                             "%s%s\n", headerData, line);
+        if (strcmp(h.key, "Content-Length") == 0) {
+            continue;
+        }
+        if (headerErr < 0) {
+            printf("Parsing header data error\n");
+            return NULL;
+        }
+    }
+
+    size_t bodySize = strlen(request.body);
+
+    int size = (int)(ceil(log10(bodySize)) + 1);
+
+    char *bodySizeBuf = (char *)malloc(size);
+    sprintf(bodySizeBuf, "%zu", bodySize);
+    Header contentTypeHeader =
+        Header{.key = "Content-Length", .value = bodySizeBuf};
+
+    size_t contentTypeHeaderSize = measureHeader(contentTypeHeader);
+    char *contentTypeHeaderStr = formatHeader(contentTypeHeader);
+
+    size_t totalLen =
+        controlDataLen + request.additionalHeadersSize + contentTypeHeaderSize;
+    char *buf = (char *)malloc(totalLen);
+    int concatCode = snprintf(buf, totalLen, "%s\n%s\n%s", controlData,
+                              contentTypeHeaderStr, headerData);
+    if (concatCode < 0) {
+        printf("Concat code error\n");
+        return NULL;
+    }
+
+    free(controlData);
+    free(headerData);
+
+    return buf;
 }
 
 int main(int argc, char *argv[]) {
@@ -116,23 +161,31 @@ int main(int argc, char *argv[]) {
     // Host: www.example.com
     // User-Agent: HttpInC
     // Accept-Language: en
-    Authority authority = {.hostIdentifier = "www.example.com", .port = NULL};
-    HttpUri httpUri = {.scheme = "http",
-                       .authority = authority,
-                       .path = "/testing",
-                       .query = NULL};
-    Header headers[] = {Header{.key = "User-Agent", .value = "HttpInC"},
-                        Header{.key = "Accept-Language", .value = "en"}};
+    Header h1 = Header{"User-Agent", "HttpInC"};
+    Header h2 = Header{"Accept-Language", "en"};
+
+    size_t headersSize = measureHeader(h1) + measureHeader(h2);
+    size_t headersLen = 2;
+    Header headers[] = {h1, h2};
     Request request = {
+        .scheme = "http",
+        .hostIdentifier = "www.example.com",
+        .port = 80,
+        .path = "/testing",
+        .query = NULL,
         .method = "GET",
         .protocolVersion = "HTTP/1.1",
-        .httpUri = httpUri,
         .additionalHeaders = headers,
-        .headersLen = 2,
-        .content = NULL,
+        .additionalHeadersLen = headersLen,
+        .additionalHeadersSize = headersSize,
+        .body = NULL,
     };
-    char *str = format(request);
-    printf("%s\n", str);
+    char *msg = format(request);
+    if (msg == NULL) {
+        printf("Error!");
+        return 0;
+    }
+    printf("%s\n", msg);
 
     return 0;
 }
