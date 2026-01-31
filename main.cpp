@@ -1,20 +1,28 @@
+#define WIN32_LEAN_AND_MEAN
+
 #include <cmath>
 #include <cstddef>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iphlpapi.h>
 #include <sec_api/string_s.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 // HTTP in C
 // NOTE: Optional means value can be NULL
-
+const size_t nullTermSize = 1;
+// Represents a query parameter in a URI
 typedef struct Query {
+    // e.g. name
     char const *key;
+    // e.g. somename
     char const *value;
 } Query;
 
@@ -27,25 +35,37 @@ typedef struct Header {
 
 typedef struct Request {
     // HTTP scheme
+    //
     // Either http or https
     char const *scheme;
     // Identifier of the host - can be IP
-    // e.g. www.something.com
+    //
+    // e.g. www.something.com, 127.0.0.1
     char const *hostIdentifier;
     // Port number of target
+    //
     // Optional
-    // e.g.8080
-    uint16_t port;
+    //
+    // Interpreted as uint_16
+    //
+    // e.g."8080"
+    char const *port;
     // Sub path from the hostIdentifier
     char const *path;
     // List of query parameters
+    //
     // Optional
     Query *query;
-    // Method - GET, POST, etc.
+    // Method
+    //
+    // GET, POST, etc.
     char const *method;
-    // Version - HTTP/1.1
+    // Version
+    //
+    // e.g. HTTP/1.1
     char const *protocolVersion;
     // The additional headers to add onto the request
+    //
     // e.g. User-Agent: HttpInC
     Header *additionalHeaders;
     // Number of headers given
@@ -54,7 +74,6 @@ typedef struct Request {
     const char *contentType;
     // The body of the request
     char const *body;
-
 } Request;
 
 typedef struct Response {
@@ -64,186 +83,217 @@ typedef struct Response {
 // TODO: Check for userinfo in url and treat as error - deprecated and malicious
 // TODO: Multiple headers with same key are concatenated together
 
-size_t getSize(Header h) {
-    // 3 due to colon, space and null terminator
-    return (strlen(h.key) + strlen(h.value)) + strlen("\r\n") + 3;
-}
-
-size_t getSizeOfHeaders(Header headers[], size_t headerLen) {
-    size_t size = 0;
-    for (int i = 0; i < headerLen; i++) {
-        size += getSize(headers[i]);
-    }
-    return size;
+size_t sizeHeaderContent(Header h) {
+    return (strlen(h.key) + strlen(":") + strlen(" ") + strlen(h.value));
 }
 
 char *serializeHeader(Header h) {
-    size_t headerContentSize = getSize(h);
-    char *headerContent = (char *)malloc(headerContentSize);
-    int headerErr = snprintf(headerContent, headerContentSize, "%s: %s\r\n",
-                             h.key, h.value);
-    if (headerErr < 0) {
+    size_t headerSize = sizeHeaderContent(h) + strlen("\r\n") + nullTermSize;
+    char *headerContent = (char *)malloc(headerSize);
+    if (!headerContent) {
+        printf("Failed to allocate memory in serializeHeader\n");
+        return NULL;
+    }
+    int written =
+        snprintf(headerContent, headerSize, "%s: %s\r\n", h.key, h.value);
+    if (written < 0) {
+        printf("Failed to encode header\n");
         return NULL;
     }
     return headerContent;
 }
 
-char *serializeHeaders(Header *headers, size_t headersLen) {
-    size_t headersSize = getSizeOfHeaders(headers, headersLen);
-    char *headerData = (char *)calloc(headersSize, sizeof(char));
-    if (!headerData)
-        return NULL;
-
-    char *ptr = headerData;
-    size_t remaining = headersSize;
-
-    for (size_t i = 0; i < headersLen; i++) {
-        char *line = serializeHeader(headers[i]);
-
-        if (strcpy_s(ptr, remaining, line) != 0) {
-            fprintf(stderr, "Buffer overflow prevented!\n");
-            return NULL;
-        }
-        size_t len = strlen(line);
-        ptr += len;
-        remaining -= len;
-
-        free(line);
-    }
-    return headerData;
-}
-
-char *getContentLength(char const *body) {
-    size_t contentLength = strlen(body);
-    size_t toAlloc = (size_t)(ceil(log10(strlen(body))) + 1) + strlen("\r\n");
-    char *contentLengthHeaderContent = (char *)malloc(toAlloc);
-    snprintf(contentLengthHeaderContent, toAlloc, "%zu", contentLength);
-    return contentLengthHeaderContent;
-}
-
 char *serializeControlData(char const *method, char const *path,
                            char const *version) {
-    size_t controlDataSize = strlen(method) + strlen(path) + strlen(version) +
-                             strlen("\r\n") + (sizeof(' ') * 2);
+    size_t controlDataSize =
+        strlen(method) + strlen(path) + strlen(version) + 3;
     char *controlData = (char *)malloc(controlDataSize);
-    int controlCode = snprintf(controlData, controlDataSize, "%s %s %s\r\n",
-                               method, path, version);
-    if (controlCode < 0) {
+    if (!controlData) {
+        printf("Failed to allocate memory in serializeControlData\n");
+        return NULL;
+    }
+    int written = snprintf(controlData, controlDataSize, "%s %s %s", method,
+                           path, version);
+    if (written < 0) {
         printf("Control code error\r\n");
         return NULL;
     }
     return controlData;
 }
 
-char *serializeRequestHeaders(const char *contentType, const char *body,
-                              Header *additionalHeaders,
-                              size_t additionalHeadersLen) {
-    const int mandatoryHeadersLen = 2;
-    size_t totalHeadersLen = additionalHeadersLen + mandatoryHeadersLen;
-
-    Header contentTypeHeader = Header{"Content-Type", contentType};
-    char const *contentLength = "0";
-    if (body != NULL) {
-        contentLength = getContentLength(body);
+size_t sizeHeadersContent(Header *headers, size_t len) {
+    size_t s = 0;
+    for (int i = 0; i < len; i++) {
+        s += sizeHeaderContent(headers[i]);
     }
-    Header contentLengthHeader = Header{"Content-Length", contentLength};
-    Header mandatoryHeaders[] = {contentTypeHeader, contentLengthHeader};
-    char *mandatoryHeadersData =
-        serializeHeaders(mandatoryHeaders, mandatoryHeadersLen);
-    if (additionalHeadersLen != 0) {
-        char *additionalHeaderData =
-            serializeHeaders(additionalHeaders, additionalHeadersLen);
-        if (additionalHeaderData == NULL) {
-            printf("Serialize headers error: header data was NULL but "
-                   "additional headers len was set > 0 \r\n");
-            return NULL;
-        }
-        size_t totalHeadersDataSize = strlen(mandatoryHeadersData) +
-                                      strlen(additionalHeaderData) +
-                                      (strlen("\r\n"));
-        char *totalHeadersData = (char *)malloc(totalHeadersDataSize);
-        snprintf(totalHeadersData, totalHeadersDataSize, "%s%s",
-                 mandatoryHeadersData, additionalHeaderData);
-        return totalHeadersData;
-    } else {
-        return mandatoryHeadersData;
-    }
+    return s;
 }
 
-// Serialize the given `Request` into an HTTP message.
-// If an error occurs, this function will return NULL.
-// Caller owns memory.
-char *serializeHttpRequest(Request request) {
-    char *controlData = serializeControlData(request.method, request.path,
-                                             request.protocolVersion);
-    if (controlData == NULL) {
-        printf("SerializeControlData error: controlData was NULL\r\n");
+char *serializeHeaders(Header *headers, size_t len) {
+    size_t headersContentSize = sizeHeadersContent(headers, len);
+    size_t headersSize =
+        headersContentSize + (len * strlen("\r\n")) + nullTermSize;
+
+    char *serial = (char *)calloc(headersSize, sizeof(char));
+
+    for (int i = 0; i < len; i++) {
+        char *headerContent = serializeHeader(headers[i]);
+        printf("%s\r\n", headerContent);
+        if (!headerContent) {
+            printf("Error from serialize header\n");
+            return NULL;
+        }
+        int badRes = strcat_s(serial, headersSize, headerContent);
+        if (badRes) {
+            printf("Error from strcat_s\n");
+            return NULL;
+        }
+    }
+    return serial;
+}
+
+char const *sendRequest(Request request) {
+    char *control = serializeControlData(request.method, request.path,
+                                         request.protocolVersion);
+
+    Header headers[] = {Header{
+        "Host",
+        request.hostIdentifier,
+    }};
+    size_t headersLen = sizeof(headers) / sizeof(headers[0]);
+    char *header = serializeHeaders(headers, headersLen);
+    if (!header) {
+        printf("Error from serializeHeaders\n");
+        return NULL;
+    }
+    size_t len = strlen(control) + strlen("\r\n") + strlen(header) +
+                 strlen("\r\n") + nullTermSize;
+    char *msgBuf = (char *)malloc(len);
+    int written = snprintf(msgBuf, len, "%s\r\n%s\r\n", control, header);
+    char msg[strlen(msgBuf)];
+    memcpy(msg, msgBuf, strlen(msgBuf) + 3);
+    printf("%s", msg);
+    printf("----\r\n");
+
+    struct addrinfo *result = NULL, *ptr = NULL, hints;
+
+    ZeroMemory(&hints, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    printf("Sending to: %s:%s\n", request.hostIdentifier, request.port);
+
+    int iResult =
+        getaddrinfo(request.hostIdentifier, request.port, &hints, &result);
+    if (iResult) {
+        printf("getaddrinfo failure: %d\n", iResult);
+        WSACleanup();
+        return NULL;
+    }
+    SOCKET connectSocket = INVALID_SOCKET;
+    ptr = result;
+    connectSocket = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+    if (connectSocket == INVALID_SOCKET) {
+        printf("Error at socket(): %d\n", WSAGetLastError());
+        freeaddrinfo(result);
+        return NULL;
+    }
+    iResult = connect(connectSocket, ptr->ai_addr, ptr->ai_addrlen);
+
+    if (iResult == SOCKET_ERROR) {
+        closesocket(connectSocket);
+        connectSocket = INVALID_SOCKET;
+    }
+
+    freeaddrinfo(result);
+
+    if (connectSocket == INVALID_SOCKET) {
+        printf("Unable to connect to server!\n");
+        WSACleanup();
+        return NULL;
+    }
+    printf("Successful connection to socket was made!\n");
+
+    iResult = send(connectSocket, msg, strlen(msg) + 1, 0);
+    if (iResult == SOCKET_ERROR) {
+        printf("send Failed %d\n", WSAGetLastError());
+        closesocket(connectSocket);
+        WSACleanup();
         return NULL;
     }
 
-    char *headerData = serializeRequestHeaders(
-        request.contentType, request.body, request.additionalHeaders,
-        request.additionalHeadersLen);
-
-    size_t bodySize = 0;
-    if (request.body != NULL) {
-        // for the 2 new lines in the print
-        bodySize = strlen(request.body) + strlen("\r\n");
-    }
-    size_t totalSize = strlen(controlData) + strlen(headerData) + bodySize;
-
-    char *msg = (char *)malloc(totalSize);
-    int msgCode;
-    if (request.body != NULL) {
-        msgCode = snprintf(msg, totalSize + 6, "%s\r\n%s\r\n%s\r\n",
-                           controlData, headerData, request.body);
-    } else {
-        msgCode = snprintf(msg, totalSize + 4, "%s\r\n%s\r\n", controlData,
-                           headerData);
-    }
-
-    if (msgCode < 0) {
-        printf("Concat code error\r\n");
+    printf("Bytes sent: %d\n", iResult);
+    iResult = shutdown(connectSocket, SD_SEND);
+    if (iResult == SOCKET_ERROR) {
+        printf("shutdown failed: %d\n", WSAGetLastError());
+        closesocket(connectSocket);
         return NULL;
     }
 
-    free(controlData);
-    free(headerData);
+    char *recvbuf = (char *)calloc(512, sizeof(char));
+    if (!recvbuf) {
+        printf("Error allocating memory in sendRequest()\n");
+        return NULL;
+    }
+    do {
+        iResult = recv(connectSocket, recvbuf, 512, 0);
+        if (iResult > 0) {
+            printf("Bytes received: %d\n", iResult);
+        } else if (iResult == 0) {
+            printf("Connection closed\n");
+        } else {
+            printf("recv failed: %d\n", WSAGetLastError());
+        }
+    } while (iResult > 0);
+    closesocket(connectSocket);
 
-    return msg;
+    return recvbuf;
 }
 
 int main(int argc, char *argv[]) {
     printf("\r\n");
 
-    char const *body = "Hello, World!";
+    // Setup of winsock
+    WSADATA wsadata;
 
-    Header h1 = Header{"User-Agent", "HttpInC"};
-    Header h2 = Header{"Accept-Language", "en"};
+    int iResult = WSAStartup(MAKEWORD(2, 2), &wsadata);
+    if (iResult != 0) {
+        printf("WSAStartup failed: %d\n", iResult);
+        return 1;
+    }
 
-    Header headers[] = {h1, h2};
-    size_t headersLen = sizeof(headers) / sizeof(headers[0]);
+    char const *body = "Hello, World!\r\n";
+
+    Header headers[] = {
+        Header{"Accept-Language", "en"},
+        Header{"User-Agent", "httpinc/0.1"},
+        Header{"Accept", "*/*"},
+        Header{"Accept-Encoding", "gzip, deflate, br, zstd"},
+        Header{"Upgrade-Insecure-Requests", "1"},
+        Header{"Connection", "keep-alive"},
+
+    };
+    // size_t headersLen = sizeof(headers) / sizeof(headers[0]);
     Request request = {
         .scheme = "http",
-        .hostIdentifier = "www.example.com",
-        .port = 80,
-        .path = "/testing",
+        .hostIdentifier = "127.0.0.1",
+        .port = "8080",
+        .path = "/hello",
         .query = NULL,
         .method = "GET",
         .protocolVersion = "HTTP/1.1",
         .additionalHeaders = headers,
-        .additionalHeadersLen = 2,
-        .contentType = "text/plain",
+        .additionalHeadersLen = 0,
+        .contentType = "text/plain; charset=utf-8",
         .body = NULL,
-
     };
-    char *msg = serializeHttpRequest(request);
-    if (msg == NULL) {
-        printf("Error!");
-        return 0;
+    char const *rawResponse = sendRequest(request);
+    if (!rawResponse) {
+        printf("Error!\n");
+        return 1;
     }
-    printf("%s\r\n\r\n", msg);
-    free(msg);
+    printf("%s\n", rawResponse);
 
     return 0;
 }
