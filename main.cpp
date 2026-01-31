@@ -138,7 +138,6 @@ char *serializeHeaders(Header *headers, size_t len) {
 
     for (int i = 0; i < len; i++) {
         char *headerContent = serializeHeader(headers[i]);
-        printf("%s\r\n", headerContent);
         if (!headerContent) {
             printf("Error from serialize header\n");
             return NULL;
@@ -163,15 +162,15 @@ char const *sendRequest(Request request) {
     size_t headersLen = sizeof(headers) / sizeof(headers[0]);
     char *header = serializeHeaders(headers, headersLen);
     if (!header) {
-        printf("Error from serializeHeaders\n");
+        printf("Error from serializeHeaders\r\n");
         return NULL;
     }
     size_t len = strlen(control) + strlen("\r\n") + strlen(header) +
                  strlen("\r\n") + nullTermSize;
-    char *msgBuf = (char *)malloc(len);
-    int written = snprintf(msgBuf, len, "%s\r\n%s\r\n", control, header);
-    char msg[strlen(msgBuf)];
-    memcpy(msg, msgBuf, strlen(msgBuf) + 3);
+    char *msg = (char *)malloc(len);
+    int written = snprintf(msg, len, "%s\r\n%s\r\n", control, header);
+    printf("Message:\r\n");
+    printf("----\r\n");
     printf("%s", msg);
     printf("----\r\n");
 
@@ -241,11 +240,12 @@ char const *sendRequest(Request request) {
         if (iResult > 0) {
             printf("Bytes received: %d\n", iResult);
         } else if (iResult == 0) {
-            printf("Connection closed\n");
+            printf("Connection closed\r\n");
         } else {
             printf("recv failed: %d\n", WSAGetLastError());
         }
     } while (iResult > 0);
+
     closesocket(connectSocket);
 
     return recvbuf;
@@ -293,7 +293,9 @@ int main(int argc, char *argv[]) {
         printf("Error!\n");
         return 1;
     }
-    printf("%s\n", rawResponse);
+    printf("----\r\n");
+    printf("%s", rawResponse);
+    printf("----\r\n");
 
     return 0;
 }
